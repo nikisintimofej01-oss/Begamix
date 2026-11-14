@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+
+def show_help():
+    print("Begamix CLI v1.0.0")
+    print("Usage:")
+    print("  begamix run <file.bgmx>   - Compile and run the code")
+    print("  begamix build <file.bgmx> - Compile only")
+    print("  begamix help              - Show this help")
+
+def main():
+    if len(sys.argv) < 2:
+        show_help()
+        sys.exit(1)
+
+    command = sys.argv[1]
+    if command == "help":
+        show_help()
+        sys.exit(0)
+
+    if len(sys.argv) < 3:
+        print("Error: Specify file name.")
+        sys.exit(1)
+
+    filename = sys.argv[2]
+    if not filename.endswith('.bgmx') and not filename.endswith('.bex'):
+        print("Error: File must have .bgmx or .bex extension.")
+        sys.exit(1)
+
+    # 1. Генерируем C++ код
+    print(f"\033[94m[Begamix] Compiling {filename}...\033[0m")
+    result = subprocess.run(["python3", "bgmx_cpp_generator.py", filename])
+    if result.returncode != 0:
+        print("\033[91m[Begamix] Generation failed.\033[0m")
+        sys.exit(1)
+
+    # 2. Компилируем C++
+    cpp_file = filename.rsplit('.', 1)[0] + "_generated.cpp"
+    out_file = filename.rsplit('.', 1)[0]
+    
+    print(f"\033[94m[Begamix] Building C++ binary: {out_file}\033[0m")
+    build_result = subprocess.run(["clang++", cpp_file, "-O3", "-o", out_file, "-pthread", "-lssl", "-lcrypto"])
+    if build_result.returncode != 0:
+        print("\033[91m[Begamix] C++ build failed.\033[0m")
+        sys.exit(1)
+
+    print(f"\033[92m[Begamix] Successfully built: {out_file}\033[0m")
+
+    # 3. Если команда run — запускаем
+    if command == "run":
+        print(f"\033[94m[Begamix] Running {out_file}...\033[0m\n")
+        subprocess.run([f"./{out_file}"])
+    elif command == "build":
+        print(f"[Begamix] Run it with: ./{out_file}")
+
+if __name__ == "__main__":
+    main()
