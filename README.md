@@ -1,2 +1,25 @@
-# Begamix
-A compiled programming language with its own epoll runtime, Garbage Collector (SGM), and native HTTPS libraries for Telegram/VK bots.
+# 🚀 Begamix Programming Language
+
+**Begamix** — это компилируемый язык программирования, созданный для написания высокопроизводительных ботов, сетевых серверов и системных скриптов. 
+
+## 🔥 Ключевые особенности
+- **Компиляция в машинный код:** Код на Begamix (`.bex`) транслируется в C++ и компилируется через `clang++` в нативный бинарник.
+- **Свой асинхронный рантайм:** Встроенный Event Loop на базе `epoll` с пулом воркеров. 
+- **Свой Garbage Collector (SGM):** Модульный сборщик мусора (System Garbage Musor), который делает несколько проходов и защищает от удаления нужных объектов.
+- **Свои базы данных:** Легковесная `BegaDB` для текстовых данных и `AuroraDB` для игр (бинарный формат).
+- **Дружелюбные библиотеки:** `prosto-tg` и `my-vk` для быстрого создания ботов без сложного синтаксиса.
+- **Нативные HTTPS-сокеты:** Отправка сообщений в Telegram и VK напрямую, без `curl` и сторонних библиотек.
+
+## 📦 Архитектура проекта
+- `bgmx_parser.py` — Парсер кода Begamix.
+- `bgmx_cpp_generator.py` — Транспилятор в C++.
+- `gtwrite.bgmx` — Исходник серверного рантайма.
+- `sgm_engine.hpp` — Движок сборщика мусора.
+- `aurora_db.py` — Игровая база данных.
+- `brequests.hpp`, `bauto.hpp` — Библиотеки для работы с API.
+
+## 💻 Пример кода (Telegram-бот)
+```begamix
+// bot.bex
+console.log.begamix("Starting bot...")
+prosto.tg.send("123456789", "Привет из Begamix!")

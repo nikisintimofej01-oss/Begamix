@@ -1,0 +1,2380 @@
+// ============================================================================
+// GTWrite — асинхронный рантайм под Callback API (ВК/Telegram)
+// Файл: gtwrite.bgmx
+// Блок: 1 — Шапка, константы, память, базовая печать, утилиты
+// Автор: Silver AI Company (Kerry Silver AI)
+// Лицензия: Silver AI Internal License
+// ============================================================================
+//
+// Архитектура:
+//   [HTTP приём] -> [Мгновенный 200 OK] -> [JSON парсер] -> [Task Queue]
+//                                                              |
+//                                                       [Worker Pool]
+//                                                              |
+//                                              [Callback API / обработчики]
+//
+// Ключевая идея: Zero-Latency. Сервер получает "200 OK" ДО обработки
+// сообщения. Обработка идёт асинхронно в пуле воркеров.
+//
+// Рантайм работает ТОЛЬКО с Callback API: ВК (VK Callback API) и
+// Telegram (webhook). Long polling не поддерживается.
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// Раздел 1.0. Метаданные рантайма
+// ----------------------------------------------------------------------------
+
+bgmx.var.string: <<RT_NAME = "GTWrite">>: bgmx.var.end
+bgmx.var.string: <<RT_VERSION = "1.0.0">>: bgmx.var.end
+bgmx.var.string: <<RT_AUTHOR = "Kerry Silver AI">>: bgmx.var.end
+bgmx.var.string: <<RT_COMPANY = "Silver AI Company">>: bgmx.var.end
+
+// Режим отладки: 0 = выкл, 1 = вкл
+bgmx.var.int: <<RT_DEBUG = 0>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 1.1. Константы HTTP
+// ----------------------------------------------------------------------------
+
+bgmx.var.string: <<HTTP_OK = "HTTP/1.1 200 OK">>: bgmx.var.end
+bgmx.var.string: <<HTTP_500 = "HTTP/1.1 500 Internal Server Error">>: bgmx.var.end
+bgmx.var.string: <<HTTP_404 = "HTTP/1.1 404 Not Found">>: bgmx.var.end
+bgmx.var.string: <<HTTP_403 = "HTTP/1.1 403 Forbidden">>: bgmx.var.end
+
+bgmx.var.string: <<HEADER_JSON = "Content-Type: application/json">>: bgmx.var.end
+bgmx.var.string: <<HEADER_LEN = "Content-Length: ">>: bgmx.var.end
+bgmx.var.string: <<HEADER_END = "\r\n\r\n">>: bgmx.var.end
+bgmx.var.string: <<LINE_END = "\r\n">>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 1.2. Константы очереди и воркеров
+// ----------------------------------------------------------------------------
+
+// Максимальный размер очереди задач (защита от переполнения памяти)
+bgmx.var.int: <<QUEUE_MAX = 10000>>: bgmx.var.end
+
+// Число воркеров в пуле
+bgmx.var.int: <<WORKERS_COUNT = 8>>: bgmx.var.end
+
+// Таймаут задачи в миллисекундах
+bgmx.var.int: <<TASK_TIMEOUT_MS = 30000>>: bgmx.var.end
+
+// Интервал idle-сна воркера (мс)
+bgmx.var.int: <<WORKER_IDLE_SLEEP_MS = 5>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 1.3. Константы Retry-логики
+// ----------------------------------------------------------------------------
+
+bgmx.var.int: <<RETRY_MAX = 5>>: bgmx.var.end
+bgmx.var.int: <<RETRY_BASE_DELAY_MS = 100>>: bgmx.var.end
+bgmx.var.int: <<RETRY_MAX_DELAY_MS = 10000>>: bgmx.var.end
+bgmx.var.float: <<RETRY_MULTIPLIER = 2.0>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 1.4. Константы Callback API
+// ----------------------------------------------------------------------------
+
+bgmx.var.string: <<API_VK = "vk">>: bgmx.var.end
+bgmx.var.string: <<API_TG = "telegram">>: bgmx.var.end
+
+// Типы событий ВК
+bgmx.var.string: <<VK_EVENT_MESSAGE_NEW = "message_new">>: bgmx.var.end
+bgmx.var.string: <<VK_EVENT_CONFIRMATION = "confirmation">>: bgmx.var.end
+bgmx.var.string: <<VK_EVENT_MESSAGE_REPLY = "message_reply">>: bgmx.var.end
+
+// Типы событий Telegram
+bgmx.var.string: <<TG_EVENT_MESSAGE = "message">>: bgmx.var.end
+bgmx.var.string: <<TG_EVENT_CALLBACK = "callback_query">>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 1.5. Сырая память (имитация низкоуровневых регистров)
+// ----------------------------------------------------------------------------
+
+// Эти переменные используются как "регистры" рантайма.
+// Каждая — 64-битное целое (имитация указателей и счётчиков).
+
+bgmx.var.int: <<REG_ACC = 0>>: bgmx.var.end       // аккумулятор
+bgmx.var.int: <<REG_TMP = 0>>: bgmx.var.end       // временный регистр
+bgmx.var.int: <<REG_PTR = 0>>: bgmx.var.end       // указатель (индекс)
+bgmx.var.int: <<REG_LEN = 0>>: bgmx.var.end       // длина
+bgmx.var.int: <<REG_FLAG = 0>>: bgmx.var.end      // флаг состояния
+bgmx.var.int: <<REG_ERR = 0>>: bgmx.var.end       // код ошибки
+bgmx.var.int: <<REG_RETRY = 0>>: bgmx.var.end     // счётчик повторов
+bgmx.var.int: <<REG_TASK_ID = 0>>: bgmx.var.end   // ID текущей задачи
+
+// ----------------------------------------------------------------------------
+// Раздел 1.6. Печать (обёртка над bgmx.bxprint)
+// ----------------------------------------------------------------------------
+
+// Печатает строку с префиксом [GTWrite].
+bgmx.bxprint: <<"[GTWrite] ">>: bgmx.print.end
+
+// Обёртка для отладочной печати.
+// Используется во всех модулях рантайма.
+fun rt_print(msg: string)
+    bgmx.bxprint: <<"[GTWrite] ">>: bgmx.print.end
+    bgmx.bxprint: <<msg>>: bgmx.print.end
+    bgmx.bxprint: <<"\n">>: bgmx.print.end
+    bex.to.me
+
+
+// Отладочная печать (только при RT_DEBUG > 0).
+fun rt_debug(msg: string)
+    bgmx.anon: <<RT_DEBUG > 0>>
+        bgmx.bxprint: <<"[DEBUG] ">>: bgmx.print.end
+        bgmx.bxprint: <<msg>>: bgmx.print.end
+        bgmx.bxprint: <<"\n">>: bgmx.print.end
+    bgmx.to.ef
+    bex.to.me
+
+
+// Печать ошибки.
+fun rt_error(msg: string)
+    bgmx.bxprint: <<"[ERROR] ">>: bgmx.print.end
+    bgmx.bxprint: <<msg>>: bgmx.print.end
+    bgmx.bxprint: <<"\n">>: bgmx.print.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 1.7. Утилиты: строки
+// ----------------------------------------------------------------------------
+
+// Длина строки.
+fun str_len(s: string)
+    bgmx.var.int: <<n = 0>>: bgmx.var.end
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < len(s)
+        bgmx.var.int: <<n = n + 1>>: bgmx.var.end
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me n
+    bex.to.me 0
+
+
+// Сравнение строк (0 = равны, 1 = не равны).
+fun str_eq(a: string, b: string)
+    bgmx.anon: <<a == b>>
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// Проверка, начинается ли строка с префикса.
+fun str_starts(s: string, prefix: string)
+    bgmx.var.int: <<lp = len(prefix)>>: bgmx.var.end
+    bgmx.anon: <<lp > len(s)>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < lp
+        bgmx.anon: <<s[i] != prefix[i]>>
+            bex.to.me 0
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me 1
+    bex.to.me 0
+
+
+// Проверка, заканчивается ли строка суффиксом.
+fun str_ends(s: string, suffix: string)
+    bgmx.var.int: <<ls = len(s)>>: bgmx.var.end
+    bgmx.var.int: <<lp = len(suffix)>>: bgmx.var.end
+    bgmx.anon: <<lp > ls>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < lp
+        bgmx.anon: <<s[ls - lp + i] != suffix[i]>>
+            bex.to.me 0
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 1.8. Утилиты: числа
+// ----------------------------------------------------------------------------
+
+// Модуль целого числа.
+fun iabs(x: int)
+    bgmx.anon: <<x < 0>>
+        bex.to.me 0 - x
+    bgmx.to.ef
+    bex.to.me x
+    bex.to.me 0
+
+
+// Максимум из двух целых.
+fun imax(a: int, b: int)
+    bgmx.anon: <<a > b>>
+        bex.to.me a
+    bgmx.to.ef
+    bex.to.me b
+    bex.to.me 0
+
+
+// Минимум из двух целых.
+fun imin(a: int, b: int)
+    bgmx.anon: <<a < b>>
+        bex.to.me a
+    bgmx.to.ef
+    bex.to.me b
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 1.9. Утилиты: время (мс)
+// ----------------------------------------------------------------------------
+
+// Возвращает текущий timestamp в миллисекундах.
+// В Begamix нет системного вызова — имитируем через монотонный счётчик.
+bgmx.var.int: <<CLOCK_MS = 0>>: bgmx.var.end
+
+fun clock_now_ms()
+    bgmx.var.int: <<CLOCK_MS = CLOCK_MS + 1>>: bgmx.var.end
+    bex.to.me CLOCK_MS
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 1.10. Утилиты: sleep (имитация)
+// ----------------------------------------------------------------------------
+
+// Имитация сна воркера. В реальном рантайме здесь был бы futex/condvar.
+fun rt_sleep_ms(ms: int)
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < ms
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 1.11. Утилиты: ID генератор
+// ----------------------------------------------------------------------------
+
+bgmx.var.int: <<ID_COUNTER = 0>>: bgmx.var.end
+
+fun next_task_id()
+    bgmx.var.int: <<ID_COUNTER = ID_COUNTER + 1>>: bgmx.var.end
+    bex.to.me ID_COUNTER
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 1.12. Конец блока 1
+// ----------------------------------------------------------------------------
+// Следующий блок: JSON-парсер (посимвольный, низкоуровневый).
+// ----------------------------------------------------------------------------
+// ============================================================================
+// Блок 2 — JSON-парсер (посимвольный, низкоуровневый)
+// ============================================================================
+//
+// Callback API присылает JSON. Рантайм должен его разобрать быстро и
+// без внешних библиотек. Реализуем собственный парсер:
+//   - пропуск пробелов
+//   - строки (с экранированием)
+//   - числа (int/float)
+//   - true/false/null
+//   - объекты { } и массивы [ ]
+//
+// Результат парсинга — словарь (dict) или список (list).
+// Парсер рекурсивный: вложенные объекты/массивы обрабатываются рекурсивно.
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.1. Класс JSON-парсера (через глобальные переменные)
+// ----------------------------------------------------------------------------
+
+// Входная строка
+bgmx.var.string: <<JSON_SRC = "">>: bgmx.var.end
+
+// Текущая позиция парсера
+bgmx.var.int: <<JSON_POS = 0>>: bgmx.var.end
+
+// Длина входной строки
+bgmx.var.int: <<JSON_LEN = 0>>: bgmx.var.end
+
+// Флаг ошибки парсинга
+bgmx.var.int: <<JSON_ERR = 0>>: bgmx.var.end
+
+// Сообщение об ошибке
+bgmx.var.string: <<JSON_ERR_MSG = "">>: bgmx.var.end
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.2. Инициализация парсера
+// ----------------------------------------------------------------------------
+
+// Сбрасывает состояние парсера на новую строку.
+fun json_init(src: string)
+    JSON_SRC = src
+    JSON_POS = 0
+    JSON_LEN = len(src)
+    JSON_ERR = 0
+    JSON_ERR_MSG = ""
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.3. Базовые операции с позицией
+// ----------------------------------------------------------------------------
+
+// Текущий символ (или '\0' если конец).
+fun json_peek()
+    bgmx.anon: <<JSON_POS >= JSON_LEN>>
+        bex.to.me ""
+    bgmx.to.ef
+    bex.to.me JSON_SRC[JSON_POS]
+    bex.to.me ""
+
+
+// Следующий символ без сдвига.
+fun json_peek_next()
+    bgmx.anon: <<JSON_POS + 1 >= JSON_LEN>>
+        bex.to.me ""
+    bgmx.to.ef
+    bex.to.me JSON_SRC[JSON_POS + 1]
+    bex.to.me ""
+
+
+// Сдвиг позиции на 1.
+fun json_advance()
+    bgmx.var.int: <<JSON_POS = JSON_POS + 1>>: bgmx.var.end
+    bex.to.me
+
+
+// Проверка на конец строки.
+fun json_eof()
+    bgmx.anon: <<JSON_POS >= JSON_LEN>>
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.4. Пропуск пробелов
+// ----------------------------------------------------------------------------
+
+// Пропускает пробелы, табы, переводы строк.
+fun json_skip_ws()
+    while JSON_POS < JSON_LEN
+        bgmx.var.string: <<c = JSON_SRC[JSON_POS]>>: bgmx.var.end
+        bgmx.anon: <<c == " ">>
+            bgmx.var.int: <<JSON_POS = JSON_POS + 1>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.anon: <<c == "\t">>
+            bgmx.var.int: <<JSON_POS = JSON_POS + 1>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.anon: <<c == "\n">>
+            bgmx.var.int: <<JSON_POS = JSON_POS + 1>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.anon: <<c == "\r">>
+            bgmx.var.int: <<JSON_POS = JSON_POS + 1>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.anon: <<c != " ">>
+            bgmx.anon: <<c != "\t">>
+                bgmx.anon: <<c != "\n">>
+                    bgmx.anon: <<c != "\r">>
+                        bex.to.me
+                    bgmx.to.ef
+                bgmx.to.ef
+            bgmx.to.ef
+        bgmx.to.ef
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.5. Парсинг строки
+// ----------------------------------------------------------------------------
+
+// Парсит JSON-строку в кавычках. Возвращает содержимое без кавычек.
+// Обрабатывает escape-последовательности: \" \\ \/ \n \t \r.
+fun json_parse_string()
+    // Ожидаем открывающую кавычку
+    bgmx.anon: <<json_peek() != "\"">>
+        JSON_ERR = 1
+        JSON_ERR_MSG = "expected opening quote"
+        bex.to.me ""
+    bgmx.to.ef
+    json_advance()
+
+    bgmx.var.string: <<result = "">>: bgmx.var.end
+    while JSON_POS < JSON_LEN
+        bgmx.var.string: <<c = JSON_SRC[JSON_POS]>>: bgmx.var.end
+        bgmx.anon: <<c == "\"">>
+            json_advance()
+            bex.to.me result
+        bgmx.to.ef
+        bgmx.anon: <<c == "\\">>
+            json_advance()
+            bgmx.var.string: <<esc = JSON_SRC[JSON_POS]>>: bgmx.var.end
+            bgmx.anon: <<esc == "\"">>
+                bgmx.var.string: <<result = result + "\"">>: bgmx.var.end
+            bgmx.to.ef
+            bgmx.anon: <<esc == "\\">>
+                bgmx.var.string: <<result = result + "\\">>: bgmx.var.end
+            bgmx.to.ef
+            bgmx.anon: <<esc == "/">>
+                bgmx.var.string: <<result = result + "/">>: bgmx.var.end
+            bgmx.to.ef
+            bgmx.anon: <<esc == "n">>
+                bgmx.var.string: <<result = result + "\n">>: bgmx.var.end
+            bgmx.to.ef
+            bgmx.anon: <<esc == "t">>
+                bgmx.var.string: <<result = result + "\t">>: bgmx.var.end
+            bgmx.to.ef
+            bgmx.anon: <<esc == "r">>
+                bgmx.var.string: <<result = result + "\r">>: bgmx.var.end
+            bgmx.to.ef
+            bgmx.anon: <<esc == "u">>
+                // Пропускаем 4 hex-цифры (упрощённо)
+                json_advance()
+                bgmx.var.int: <<k = 0>>: bgmx.var.end
+                while k < 4
+                    json_advance()
+                    bgmx.var.int: <<k = k + 1>>: bgmx.var.end
+            bgmx.to.ef
+        bgmx.to.ef
+        bgmx.var.string: <<result = result + c>>: bgmx.var.end
+        json_advance()
+    JSON_ERR = 1
+    JSON_ERR_MSG = "unterminated string"
+    bex.to.me result
+    bex.to.me ""
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.6. Парсинг числа
+// ----------------------------------------------------------------------------
+
+// Парсит JSON-число (int или float). Возвращает как float.
+fun json_parse_number()
+    bgmx.var.string: <<buf = "">>: bgmx.var.end
+    bgmx.var.int: <<is_neg = 0>>: bgmx.var.end
+    bgmx.anon: <<json_peek() == "-">>
+        bgmx.var.int: <<is_neg = 1>>: bgmx.var.end
+        json_advance()
+    bgmx.to.ef
+
+    while JSON_POS < JSON_LEN
+        bgmx.var.string: <<c = JSON_SRC[JSON_POS]>>: bgmx.var.end
+        bgmx.anon: <<c >= "0">>
+            bgmx.anon: <<c <= "9">>
+                bgmx.var.string: <<buf = buf + c>>: bgmx.var.end
+                json_advance()
+            bgmx.to.ef
+        bgmx.to.ef
+        bgmx.anon: <<c == ".">>
+            bgmx.var.string: <<buf = buf + ".">>: bgmx.var.end
+            json_advance()
+        bgmx.to.ef
+        bgmx.anon: <<c == "e">>
+            bgmx.var.string: <<buf = buf + "e">>: bgmx.var.end
+            json_advance()
+        bgmx.to.ef
+        bgmx.anon: <<c == "E">>
+            bgmx.var.string: <<buf = buf + "e">>: bgmx.var.end
+            json_advance()
+        bgmx.to.ef
+        bgmx.anon: <<c == "+">>
+            bgmx.var.string: <<buf = buf + "+">>: bgmx.var.end
+            json_advance()
+        bgmx.to.ef
+        bgmx.anon: <<c == "-">>
+            bgmx.var.string: <<buf = buf + "-">>: bgmx.var.end
+            json_advance()
+        bgmx.to.ef
+        bgmx.anon: <<c < "0">>
+            bex.to.me 0.0 + ("" + buf) * (1.0 - 2.0 * is_neg)
+        bgmx.to.ef
+        bgmx.anon: <<c > "9">>
+            bgmx.anon: <<c != ".">>
+                bgmx.anon: <<c != "e">>
+                    bgmx.anon: <<c != "E">>
+                        bex.to.me 0.0 + ("" + buf) * (1.0 - 2.0 * is_neg)
+                    bgmx.to.ef
+                bgmx.to.ef
+            bgmx.to.ef
+        bgmx.to.ef
+    bex.to.me 0.0 + ("" + buf) * (1.0 - 2.0 * is_neg)
+    bex.to.me 0.0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.7. Парсинг true/false/null
+// ----------------------------------------------------------------------------
+
+fun json_parse_true()
+    // ожидаем "true"
+    json_advance()
+    json_advance()
+    json_advance()
+    json_advance()
+    bex.to.me 1
+    bex.to.me 0
+
+
+fun json_parse_false()
+    // ожидаем "false"
+    json_advance()
+    json_advance()
+    json_advance()
+    json_advance()
+    json_advance()
+    bex.to.me 0
+    bex.to.me 0
+
+
+fun json_parse_null()
+    // ожидаем "null"
+    json_advance()
+    json_advance()
+    json_advance()
+    json_advance()
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.8. Парсинг массива
+// ----------------------------------------------------------------------------
+
+// Парсит JSON-массив [ ... ]. Возвращает список.
+fun json_parse_array()
+    // Ожидаем [
+    bgmx.anon: <<json_peek() != "[">>
+        JSON_ERR = 1
+        JSON_ERR_MSG = "expected ["
+        bex.to.me []
+    bgmx.to.ef
+    json_advance()
+
+    bgmx.var.list: <<result = []>>: bgmx.var.end
+    json_skip_ws()
+
+    bgmx.anon: <<json_peek() == "]">>
+        json_advance()
+        bex.to.me result
+    bgmx.to.ef
+
+    while JSON_POS < JSON_LEN
+        bgmx.var.any: <<item = json_parse_value()>>: bgmx.var.end
+        bgmx.anon: <<JSON_ERR == 1>>
+            bex.to.me result
+        bgmx.to.ef
+        bgmx.var.list: <<result = result + [item]>>: bgmx.var.end
+        json_skip_ws()
+        bgmx.anon: <<json_peek() == ",">>
+            json_advance()
+            json_skip_ws()
+        bgmx.to.ef
+        bgmx.anon: <<json_peek() == "]">>
+            json_advance()
+            bex.to.me result
+        bgmx.to.ef
+    JSON_ERR = 1
+    JSON_ERR_MSG = "unterminated array"
+    bex.to.me result
+    bex.to.me []
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.9. Парсинг объекта
+// ----------------------------------------------------------------------------
+
+// Парсит JSON-объект { ... }. Возвращает словарь.
+fun json_parse_object()
+    // Ожидаем {
+    bgmx.anon: <<json_peek() != "{">>
+        JSON_ERR = 1
+        JSON_ERR_MSG = "expected {"
+        bex.to.me {}
+    bgmx.to.ef
+    json_advance()
+
+    bgmx.var.dict: <<result = {}>>: bgmx.var.end
+    json_skip_ws()
+
+    bgmx.anon: <<json_peek() == "}">>
+        json_advance()
+        bex.to.me result
+    bgmx.to.ef
+
+    while JSON_POS < JSON_LEN
+        json_skip_ws()
+        bgmx.var.string: <<key = json_parse_string()>>: bgmx.var.end
+        bgmx.anon: <<JSON_ERR == 1>>
+            bex.to.me result
+        bgmx.to.ef
+        json_skip_ws()
+        bgmx.anon: <<json_peek() == ":">>
+            json_advance()
+        bgmx.to.ef
+        json_skip_ws()
+        bgmx.var.any: <<val = json_parse_value()>>: bgmx.var.end
+        bgmx.anon: <<JSON_ERR == 1>>
+            bex.to.me result
+        bgmx.to.ef
+        result[key] = val
+        json_skip_ws()
+        bgmx.anon: <<json_peek() == ",">>
+            json_advance()
+            json_skip_ws()
+        bgmx.to.ef
+        bgmx.anon: <<json_peek() == "}">>
+            json_advance()
+            bex.to.me result
+        bgmx.to.ef
+    JSON_ERR = 1
+    JSON_ERR_MSG = "unterminated object"
+    bex.to.me result
+    bex.to.me {}
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.10. Универсальный парсер значения
+// ----------------------------------------------------------------------------
+
+// Определяет тип значения по первому символу и вызывает нужный парсер.
+fun json_parse_value()
+    json_skip_ws()
+    bgmx.anon: <<json_eof() == 1>>
+        JSON_ERR = 1
+        JSON_ERR_MSG = "unexpected end"
+        bex.to.me 0
+    bgmx.to.ef
+
+    bgmx.var.string: <<c = json_peek()>>: bgmx.var.end
+
+    bgmx.anon: <<c == "\"">>
+        bex.to.me json_parse_string()
+    bgmx.to.ef
+    bgmx.anon: <<c == "{">>
+        bex.to.me json_parse_object()
+    bgmx.to.ef
+    bgmx.anon: <<c == "[">>
+        bex.to.me json_parse_array()
+    bgmx.to.ef
+    bgmx.anon: <<c == "t">>
+        bex.to.me json_parse_true()
+    bgmx.to.ef
+    bgmx.anon: <<c == "f">>
+        bex.to.me json_parse_false()
+    bgmx.to.ef
+    bgmx.anon: <<c == "n">>
+        bex.to.me json_parse_null()
+    bgmx.to.ef
+    bex.to.me json_parse_number()
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.11. Публичная функция парсинга
+// ----------------------------------------------------------------------------
+
+// Парсит строку JSON и возвращает объект/список/число.
+// При ошибке возвращает {} и выставляет JSON_ERR = 1.
+fun json_parse(src: string)
+    json_init(src)
+    bgmx.var.any: <<result = json_parse_value()>>: bgmx.var.end
+    bgmx.anon: <<JSON_ERR == 1>>
+        rt_error("JSON parse error: " + JSON_ERR_MSG)
+        bex.to.me {}
+    bgmx.to.ef
+    bex.to.me result
+    bex.to.me {}
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.12. Вспомогательные: безопасный доступ к полям
+// ----------------------------------------------------------------------------
+
+// Достаёт поле из словаря или возвращает default.
+fun json_get(d: dict, key: string, default: any)
+    bgmx.anon: <<key in d>>
+        bex.to.me d[key]
+    bgmx.to.ef
+    bex.to.me default
+    bex.to.me default
+
+
+// Достаёт вложенное поле по пути "a.b.c".
+fun json_get_path(d: dict, path: string, default: any)
+    bgmx.var.string: <<cur_key = "">>: bgmx.var.end
+    bgmx.var.any: <<cur = d>>: bgmx.var.end
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < len(path)
+        bgmx.var.string: <<c = path[i]>>: bgmx.var.end
+        bgmx.anon: <<c == ".">>
+            bgmx.anon: <<cur_key in cur>>
+                bgmx.var.any: <<cur = cur[cur_key]>>: bgmx.var.end
+                bgmx.var.string: <<cur_key = "">>: bgmx.var.end
+            bgmx.to.ef
+            bgmx.anon: <<cur_key not in cur>>
+                bex.to.me default
+            bgmx.to.ef
+        bgmx.to.ef
+        bgmx.anon: <<c != ".">>
+            bgmx.var.string: <<cur_key = cur_key + c>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bgmx.anon: <<len(cur_key) > 0>>
+        bgmx.anon: <<cur_key in cur>>
+            bex.to.me cur[cur_key]
+        bgmx.to.ef
+    bgmx.to.ef
+    bex.to.me default
+    bex.to.me default
+
+
+// ----------------------------------------------------------------------------
+// Раздел 2.13. Конец блока 2
+// ----------------------------------------------------------------------------
+// Следующий блок: HTTP-слой (check.connection.library, 200 OK, чтение тела).
+// ----------------------------------------------------------------------------
+// ============================================================================
+// Блок 3 — HTTP-слой
+// ============================================================================
+//
+// Задачи слоя:
+//   - проверить соединение (check.connection.library)
+//   - прочитать входящий запрос (метод, путь, заголовки, тело)
+//   - отправить "200 OK" МГНОВЕННО (zero-latency), до обработки
+//   - отправить 4xx/5xx при ошибках
+//   - закрыть соединение
+//
+// Всё через check.connection.library, как требует спецификация Begamix.
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.1. Состояние соединения
+// ----------------------------------------------------------------------------
+
+// Флаг: соединение установлено (1) или нет (0)
+bgmx.var.int: <<CONN_ALIVE = 0>>: bgmx.var.end
+
+// ID текущего соединения
+bgmx.var.int: <<CONN_ID = 0>>: bgmx.var.end
+
+// Буфер входящего запроса
+bgmx.var.string: <<CONN_BUFFER = "">>: bgmx.var.end
+
+// Буфер исходящего ответа
+bgmx.var.string: <<CONN_RESPONSE = "">>: bgmx.var.end
+
+// Флаг: ответ уже отправлен (для zero-latency)
+bgmx.var.int: <<CONN_RESPONDED = 0>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 3.2. check.connection.library — проверка соединения
+// ----------------------------------------------------------------------------
+
+// Проверяет, что соединение с сервером живо.
+// Возвращает 1 если живо, 0 если нет.
+fun http_check_connection()
+    check.connection.library
+    bgmx.anon: <<CONN_ALIVE == 1>>
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// Открывает новое соединение. Присваивает ID.
+fun http_open_connection()
+    bgmx.var.int: <<CONN_ALIVE = 1>>: bgmx.var.end
+    bgmx.var.int: <<CONN_ID = CONN_ID + 1>>: bgmx.var.end
+    bgmx.var.int: <<CONN_RESPONDED = 0>>: bgmx.var.end
+    bgmx.var.string: <<CONN_BUFFER = "">>: bgmx.var.end
+    bgmx.var.string: <<CONN_RESPONSE = "">>: bgmx.var.end
+    rt_debug("соединение открыто: id=" + CONN_ID)
+    bex.to.me CONN_ID
+    bex.to.me 0
+
+
+// Закрывает соединение.
+fun http_close_connection()
+    bgmx.var.int: <<CONN_ALIVE = 0>>: bgmx.var.end
+    rt_debug("соединение закрыто: id=" + CONN_ID)
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.3. Чтение входящего запроса
+// ----------------------------------------------------------------------------
+
+// Читает запрос из соединения в CONN_BUFFER.
+// В реальном рантайме здесь был бы read() из сокета.
+// В Begamix имитируем через check.connection.library.
+fun http_read_request()
+    check.connection.library
+    bgmx.anon: <<CONN_ALIVE == 0>>
+        rt_error("http_read_request: соединение не открыто")
+        bex.to.me 0
+    bgmx.to.ef
+    // Буфер уже заполнен вышестоящим слоем (сервером)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.4. Разбор HTTP-запроса
+// ----------------------------------------------------------------------------
+
+// Извлекает метод из первой строки: "POST /path HTTP/1.1".
+fun http_parse_method(buf: string)
+    bgmx.var.string: <<result = "">>: bgmx.var.end
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < len(buf)
+        bgmx.var.string: <<c = buf[i]>>: bgmx.var.end
+        bgmx.anon: <<c == " ">>
+            bex.to.me result
+        bgmx.to.ef
+        bgmx.var.string: <<result = result + c>>: bgmx.var.end
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me result
+    bex.to.me ""
+
+
+// Извлекает путь из первой строки.
+fun http_parse_path(buf: string)
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    bgmx.var.int: <<spaces = 0>>: bgmx.var.end
+    bgmx.var.string: <<result = "">>: bgmx.var.end
+    while i < len(buf)
+        bgmx.var.string: <<c = buf[i]>>: bgmx.var.end
+        bgmx.anon: <<c == " ">>
+            bgmx.var.int: <<spaces = spaces + 1>>: bgmx.var.end
+            bgmx.anon: <<spaces == 2>>
+                bex.to.me result
+            bgmx.to.ef
+        bgmx.to.ef
+        bgmx.anon: <<spaces == 1>>
+            bgmx.anon: <<c != " ">>
+                bgmx.var.string: <<result = result + c>>: bgmx.var.end
+            bgmx.to.ef
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me result
+    bex.to.me ""
+
+
+// Извлекает тело запроса (после \r\n\r\n).
+fun http_parse_body(buf: string)
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i + 3 < len(buf)
+        bgmx.anon: <<buf[i] == "\r">>
+            bgmx.anon: <<buf[i + 1] == "\n">>
+                bgmx.anon: <<buf[i + 2] == "\r">>
+                    bgmx.anon: <<buf[i + 3] == "\n">>
+                        bex.to.me buf[i + 4 : len(buf)]
+                    bgmx.to.ef
+                bgmx.to.ef
+            bgmx.to.ef
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me ""
+    bex.to.me ""
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.5. Отправка ответов
+// ----------------------------------------------------------------------------
+
+// Отправляет "200 OK" МГНОВЕННО (zero-latency).
+// Вызывается ДО обработки сообщения. Тело ответа — пустое (или "ok").
+fun http_send_200_now()
+    bgmx.anon: <<CONN_RESPONDED == 1>>
+        bex.to.me
+    bgmx.to.ef
+    bgmx.var.string: <<CONN_RESPONSE = HTTP_OK + LINE_END + HEADER_JSON + LINE_END + HEADER_LEN + "2" + LINE_END + LINE_END + "ok">>: bgmx.var.end
+    bgmx.var.int: <<CONN_RESPONDED = 1>>: bgmx.var.end
+    rt_debug("отправлен 200 OK (zero-latency)")
+    bex.to.me
+
+
+// Отправляет произвольный ответ с телом.
+fun http_send_response(status: string, body: string)
+    bgmx.anon: <<CONN_RESPONDED == 1>>
+        bex.to.me
+    bgmx.to.ef
+    bgmx.var.string: <<CONN_RESPONSE = status + LINE_END + HEADER_JSON + LINE_END + HEADER_LEN + len(body) + LINE_END + LINE_END + body>>: bgmx.var.end
+    bgmx.var.int: <<CONN_RESPONDED = 1>>: bgmx.var.end
+    bex.to.me
+
+
+// Отправляет 404.
+fun http_send_404()
+    http_send_response(HTTP_404, "{\"error\":\"not found\"}")
+    bex.to.me
+
+
+// Отправляет 500.
+fun http_send_500(reason: string)
+    bgmx.var.string: <<body = "{\"error\":\"" + reason + "\"}">>: bgmx.var.end
+    http_send_response(HTTP_500, body)
+    bex.to.me
+
+
+// Отправляет 403.
+fun http_send_403()
+    http_send_response(HTTP_403, "{\"error\":\"forbidden\"}")
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.6. Проверка типа контента
+// ----------------------------------------------------------------------------
+
+// Проверяет, что Content-Type — application/json.
+fun http_is_json(buf: string)
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    bgmx.var.string: <<header = "">>: bgmx.var.end
+    // Ищем "Content-Type:" в буфере
+    while i + 13 < len(buf)
+        bgmx.anon: <<buf[i] == "C">>
+            bgmx.anon: <<buf[i + 1] == "o">>
+                bgmx.anon: <<buf[i + 2] == "n">>
+                    bgmx.anon: <<buf[i + 3] == "t">>
+                        bgmx.anon: <<buf[i + 4] == "e">>
+                            bgmx.anon: <<buf[i + 5] == "n">>
+                                bgmx.anon: <<buf[i + 6] == "t">>
+                                    // нашли начало
+                                    bgmx.var.int: <<j = i>>: bgmx.var.end
+                                    while j < len(buf)
+                                        bgmx.anon: <<buf[j] == "\r">>
+                                            bgmx.var.string: <<header = buf[i:j]>>: bgmx.var.end
+                                            bex.to.me str_starts(header, "Content-Type: application/json")
+                                        bgmx.to.ef
+                                        bgmx.var.int: <<j = j + 1>>: bgmx.var.end
+                                bgmx.to.ef
+                            bgmx.to.ef
+                        bgmx.to.ef
+                    bgmx.to.ef
+                bgmx.to.ef
+            bgmx.to.ef
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.7. Полный цикл приёма
+// ----------------------------------------------------------------------------
+
+// Принимает входящий запрос и возвращает словарь:
+//   { "method": ..., "path": ..., "body": ..., "raw": ... }
+// 200 OK отправляется тут же — до любой обработки.
+fun http_accept()
+    bgmx.anon: <<http_check_connection() == 0>>
+        rt_error("http_accept: нет соединения")
+        bex.to.me {}
+    bgmx.to.ef
+
+    http_open_connection()
+    http_read_request()
+
+    bgmx.var.string: <<raw = CONN_BUFFER>>: bgmx.var.end
+    bgmx.var.string: <<method = http_parse_method(raw)>>: bgmx.var.end
+    bgmx.var.string: <<path = http_parse_path(raw)>>: bgmx.var.end
+    bgmx.var.string: <<body = http_parse_body(raw)>>: bgmx.var.end
+
+    // ZERO-LATENCY: отвечаем 200 СРАЗУ
+    http_send_200_now()
+
+    bgmx.var.dict: <<req = {">>: bgmx.var.end
+        "method": method,
+        "path": path,
+        "body": body,
+        "raw": raw
+    }
+    bex.to.me req
+    bex.to.me {}
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.8. Обработка ошибок соединения
+// ----------------------------------------------------------------------------
+
+// Проверяет, что запрос валиден. Если нет — отправляет 4xx.
+fun http_validate(req: dict)
+    bgmx.anon: <<len(req) == 0>>
+        http_send_500("empty request")
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.string: <<body = req["body"]>>: bgmx.var.end
+    bgmx.anon: <<len(body) == 0>>
+        // пустое тело — это нормально для GET, но не для Callback API
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.9. Пул соединений (заготовка)
+// ----------------------------------------------------------------------------
+
+// Счётчик активных соединений
+bgmx.var.int: <<CONN_ACTIVE = 0>>: bgmx.var.end
+
+// Максимум одновременных соединений
+bgmx.var.int: <<CONN_MAX = 1024>>: bgmx.var.end
+
+fun http_conn_acquire()
+    bgmx.anon: <<CONN_ACTIVE >= CONN_MAX>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.int: <<CONN_ACTIVE = CONN_ACTIVE + 1>>: bgmx.var.end
+    bex.to.me 1
+    bex.to.me 0
+
+
+fun http_conn_release()
+    bgmx.anon: <<CONN_ACTIVE > 0>>
+        bgmx.var.int: <<CONN_ACTIVE = CONN_ACTIVE - 1>>: bgmx.var.end
+    bgmx.to.ef
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 3.10. Конец блока 3
+// ----------------------------------------------------------------------------
+// Следующий блок: Event Loop (приём запросов, zero-latency, постановка в очередь).
+// ----------------------------------------------------------------------------
+// ============================================================================
+// Блок 4 — Event Loop + Task Queue + Worker Pool (расширенный)
+// ============================================================================
+//
+// Это ядро рантайма. Три связанных компонента:
+//
+//   1. EVENT LOOP: принимает запросы, мгновенно отвечает 200, парсит JSON,
+//      кладёт задачу в очередь. Один цикл, не блокируется.
+//
+//   2. TASK QUEUE: очередь задач с приоритетами. Поддерживает push/pop,
+//      лимит размера, счётчики, метрики.
+//
+//   3. WORKER POOL: пул воркеров, каждый берёт задачу из очереди и
+//      выполняет её. Ошибки перехватываются и уходят в retry.
+//
+// Схема:
+//   [HTTP] -> [200 OK сразу] -> [JSON parse] -> [Queue.push] -> [Worker.pop]
+//                                                                    |
+//                                                          [handler.execute]
+//                                                                    |
+//                                                          [retry / метрики]
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.1. Константы очереди
+// ----------------------------------------------------------------------------
+
+bgmx.var.int: <<Q_SIZE = 0>>: bgmx.var.end          // текущий размер
+bgmx.var.int: <<Q_HEAD = 0>>: bgmx.var.end          // голова (для pop)
+bgmx.var.int: <<Q_TAIL = 0>>: bgmx.var.end          // хвост (для push)
+bgmx.var.int: <<Q_PUSHED = 0>>: bgmx.var.end        // всего добавлено
+bgmx.var.int: <<Q_POPPED = 0>>: bgmx.var.end        // всего извлечено
+bgmx.var.int: <<Q_DROPPED = 0>>: bgmx.var.end       // отброшено (переполнение)
+bgmx.var.int: <<Q_MAX_SEEN = 0>>: bgmx.var.end      // пиковый размер
+
+// Приоритеты задач
+bgmx.var.int: <<PRIO_HIGH = 3>>: bgmx.var.end
+bgmx.var.int: <<PRIO_NORMAL = 2>>: bgmx.var.end
+bgmx.var.int: <<PRIO_LOW = 1>>: bgmx.var.end
+
+// Очереди по приоритетам (три отдельных списка)
+bgmx.var.list: <<Q_HIGH = []>>: bgmx.var.end
+bgmx.var.list: <<Q_NORMAL = []>>: bgmx.var.end
+bgmx.var.list: <<Q_LOW = []>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 4.2. Task Queue — добавление
+// ----------------------------------------------------------------------------
+
+// Добавляет задачу в очередь с учётом приоритета.
+// task — словарь: { "id": int, "type": string, "payload": dict, "prio": int,
+//                   "created_ms": int, "retries": int }
+fun q_push(task: dict)
+    bgmx.anon: <<Q_SIZE >= QUEUE_MAX>>
+        bgmx.var.int: <<Q_DROPPED = Q_DROPPED + 1>>: bgmx.var.end
+        rt_error("q_push: очередь переполнена, задача отброшена")
+        bex.to.me 0
+    bgmx.to.ef
+
+    bgmx.var.int: <<prio = task["prio"]>>: bgmx.var.end
+    bgmx.anon: <<prio == PRIO_HIGH>>
+        bgmx.var.list: <<Q_HIGH = Q_HIGH + [task]>>: bgmx.var.end
+    bgmx.to.ef
+    bgmx.anon: <<prio == PRIO_NORMAL>>
+        bgmx.var.list: <<Q_NORMAL = Q_NORMAL + [task]>>: bgmx.var.end
+    bgmx.to.ef
+    bgmx.anon: <<prio == PRIO_LOW>>
+        bgmx.var.list: <<Q_LOW = Q_LOW + [task]>>: bgmx.var.end
+    bgmx.to.ef
+
+    bgmx.var.int: <<Q_SIZE = Q_SIZE + 1>>: bgmx.var.end
+    bgmx.var.int: <<Q_PUSHED = Q_PUSHED + 1>>: bgmx.var.end
+    bgmx.var.int: <<Q_TAIL = Q_TAIL + 1>>: bgmx.var.end
+    bgmx.anon: <<Q_SIZE > Q_MAX_SEEN>>
+        bgmx.var.int: <<Q_MAX_SEEN = Q_SIZE>>: bgmx.var.end
+    bgmx.to.ef
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.3. Task Queue — извлечение
+// ----------------------------------------------------------------------------
+
+// Извлекает задачу с максимальным приоритетом.
+// Сначала HIGH, потом NORMAL, потом LOW.
+// Возвращает задачу или {} если пусто.
+fun q_pop()
+    bgmx.anon: <<len(Q_HIGH) > 0>>
+        bgmx.var.dict: <<task = Q_HIGH[0]>>: bgmx.var.end
+        bgmx.var.list: <<Q_HIGH = Q_HIGH[1:len(Q_HIGH)]>>: bgmx.var.end
+        bgmx.var.int: <<Q_SIZE = Q_SIZE - 1>>: bgmx.var.end
+        bgmx.var.int: <<Q_POPPED = Q_POPPED + 1>>: bgmx.var.end
+        bgmx.var.int: <<Q_HEAD = Q_HEAD + 1>>: bgmx.var.end
+        bex.to.me task
+    bgmx.to.ef
+
+    bgmx.anon: <<len(Q_NORMAL) > 0>>
+        bgmx.var.dict: <<task = Q_NORMAL[0]>>: bgmx.var.end
+        bgmx.var.list: <<Q_NORMAL = Q_NORMAL[1:len(Q_NORMAL)]>>: bgmx.var.end
+        bgmx.var.int: <<Q_SIZE = Q_SIZE - 1>>: bgmx.var.end
+        bgmx.var.int: <<Q_POPPED = Q_POPPED + 1>>: bgmx.var.end
+        bgmx.var.int: <<Q_HEAD = Q_HEAD + 1>>: bgmx.var.end
+        bex.to.me task
+    bgmx.to.ef
+
+    bgmx.anon: <<len(Q_LOW) > 0>>
+        bgmx.var.dict: <<task = Q_LOW[0]>>: bgmx.var.end
+        bgmx.var.list: <<Q_LOW = Q_LOW[1:len(Q_LOW)]>>: bgmx.var.end
+        bgmx.var.int: <<Q_SIZE = Q_SIZE - 1>>: bgmx.var.end
+        bgmx.var.int: <<Q_POPPED = Q_POPPED + 1>>: bgmx.var.end
+        bgmx.var.int: <<Q_HEAD = Q_HEAD + 1>>: bgmx.var.end
+        bex.to.me task
+    bgmx.to.ef
+
+    bex.to.me {}
+    bex.to.me {}
+
+
+// Проверка пустоты очереди.
+fun q_empty()
+    bgmx.anon: <<Q_SIZE == 0>>
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// Размер очереди.
+fun q_count()
+    bex.to.me Q_SIZE
+    bex.to.me 0
+
+
+// Сброс очереди (для остановки рантайма).
+fun q_reset()
+    bgmx.var.int: <<Q_SIZE = 0>>: bgmx.var.end
+    bgmx.var.int: <<Q_HEAD = 0>>: bgmx.var.end
+    bgmx.var.int: <<Q_TAIL = 0>>: bgmx.var.end
+    bgmx.var.list: <<Q_HIGH = []>>: bgmx.var.end
+    bgmx.var.list: <<Q_NORMAL = []>>: bgmx.var.end
+    bgmx.var.list: <<Q_LOW = []>>: bgmx.var.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.4. Классификация входящих событий
+// ----------------------------------------------------------------------------
+
+// Определяет приоритет задачи по типу события.
+fun classify_priority(event_type: string)
+    bgmx.anon: <<event_type == VK_EVENT_CONFIRMATION>>
+        bex.to.me PRIO_HIGH
+    bgmx.to.ef
+    bgmx.anon: <<event_type == TG_EVENT_CALLBACK>>
+        bex.to.me PRIO_HIGH
+    bgmx.to.ef
+    bgmx.anon: <<event_type == VK_EVENT_MESSAGE_NEW>>
+        bex.to.me PRIO_NORMAL
+    bgmx.to.ef
+    bgmx.anon: <<event_type == TG_EVENT_MESSAGE>>
+        bex.to.me PRIO_NORMAL
+    bgmx.to.ef
+    bex.to.me PRIO_LOW
+    bex.to.me 0
+
+
+// Определяет источник (vk/telegram) по полям JSON.
+fun detect_source(payload: dict)
+    bgmx.anon: <<"type" in payload>>
+        bgmx.var.string: <<t = payload["type"]>>: bgmx.var.end
+        bgmx.anon: <<t == "confirmation">>
+            bex.to.me API_VK
+        bgmx.to.ef
+        bgmx.anon: <<t == "message_new">>
+            bex.to.me API_VK
+        bgmx.to.ef
+        bgmx.anon: <<t == "message_reply">>
+            bex.to.me API_VK
+        bgmx.to.ef
+    bgmx.to.ef
+    bgmx.anon: <<"update_id" in payload>>
+        bex.to.me API_TG
+    bgmx.to.ef
+    bgmx.anon: <<"message" in payload>>
+        bex.to.me API_TG
+    bgmx.to.ef
+    bex.to.me "unknown"
+    bex.to.me ""
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.5. Построение задачи из запроса
+// ----------------------------------------------------------------------------
+
+// Создаёт задачу из распарсенного запроса.
+fun build_task(req: dict, payload: dict)
+    bgmx.var.int: <<tid = next_task_id()>>: bgmx.var.end
+    bgmx.var.string: <<source = detect_source(payload)>>: bgmx.var.end
+    bgmx.var.string: <<etype = json_get(payload, "type", TG_EVENT_MESSAGE)>>: bgmx.var.end
+    bgmx.var.int: <<prio = classify_priority(etype)>>: bgmx.var.end
+
+    bgmx.var.dict: <<task = {">>: bgmx.var.end
+        "id": tid,
+        "type": etype,
+        "source": source,
+        "payload": payload,
+        "prio": prio,
+        "created_ms": clock_now_ms(),
+        "retries": 0,
+        "status": "pending"
+    }
+    bex.to.me task
+    bex.to.me {}
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.6. Метрики Event Loop
+// ----------------------------------------------------------------------------
+
+bgmx.var.int: <<LOOP_ACCEPTED = 0>>: bgmx.var.end     // всего принято
+bgmx.var.int: <<LOOP_PARSED = 0>>: bgmx.var.end       // успешно распарсено
+bgmx.var.int: <<LOOP_PARSE_ERR = 0>>: bgmx.var.end    // ошибок парсинга
+bgmx.var.int: <<LOOP_ENQUEUED = 0>>: bgmx.var.end     // поставлено в очередь
+bgmx.var.int: <<LOOP_ENQ_FAIL = 0>>: bgmx.var.end     // не удалось поставить
+bgmx.var.int: <<LOOP_TICK = 0>>: bgmx.var.end         // номер тика
+
+// ----------------------------------------------------------------------------
+// Раздел 4.7. Один тик Event Loop
+// ----------------------------------------------------------------------------
+
+// Один цикл: принять запрос -> 200 OK -> парсить -> enqueue.
+// Возвращает 1 если обработано, 0 если нечего обрабатывать.
+fun loop_tick()
+    bgmx.var.int: <<LOOP_TICK = LOOP_TICK + 1>>: bgmx.var.end
+
+    // 1. Принимаем запрос (внутри уже отдан 200 OK)
+    bgmx.var.dict: <<req = http_accept()>>: bgmx.var.end
+    bgmx.anon: <<len(req) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.int: <<LOOP_ACCEPTED = LOOP_ACCEPTED + 1>>: bgmx.var.end
+
+    // 2. Валидация
+    bgmx.anon: <<http_validate(req) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+
+    // 3. Парсим JSON
+    bgmx.var.string: <<body = req["body"]>>: bgmx.var.end
+    bgmx.var.dict: <<payload = json_parse(body)>>: bgmx.var.end
+    bgmx.anon: <<JSON_ERR == 1>>
+        bgmx.var.int: <<LOOP_PARSE_ERR = LOOP_PARSE_ERR + 1>>: bgmx.var.end
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.int: <<LOOP_PARSED = LOOP_PARSED + 1>>: bgmx.var.end
+
+    // 4. Строим задачу
+    bgmx.var.dict: <<task = build_task(req, payload)>>: bgmx.var.end
+
+    // 5. Кладём в очередь
+    bgmx.anon: <<q_push(task) == 1>>
+        bgmx.var.int: <<LOOP_ENQUEUED = LOOP_ENQUEUED + 1>>: bgmx.var.end
+        bex.to.me 1
+    bgmx.to.ef
+    bgmx.var.int: <<LOOP_ENQ_FAIL = LOOP_ENQ_FAIL + 1>>: bgmx.var.end
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.8. Главный цикл Event Loop
+// ----------------------------------------------------------------------------
+
+bgmx.var.int: <<LOOP_RUNNING = 0>>: bgmx.var.end
+bgmx.var.int: <<LOOP_MAX_TICKS = 0>>: bgmx.var.end   // 0 = бесконечно
+
+fun loop_start()
+    bgmx.var.int: <<LOOP_RUNNING = 1>>: bgmx.var.end
+    rt_print("Event Loop запущен")
+    bgmx.var.int: <<ticks = 0>>: bgmx.var.end
+    while LOOP_RUNNING == 1
+        bgmx.var.int: <<res = loop_tick()>>: bgmx.var.end
+        bgmx.anon: <<res == 0>>
+            rt_sleep_ms(1)
+        bgmx.to.ef
+        bgmx.var.int: <<ticks = ticks + 1>>: bgmx.var.end
+        bgmx.anon: <<LOOP_MAX_TICKS > 0>>
+            bgmx.anon: <<ticks >= LOOP_MAX_TICKS>>
+                bgmx.var.int: <<LOOP_RUNNING = 0>>: bgmx.var.end
+            bgmx.to.ef
+        bgmx.to.ef
+    rt_print("Event Loop остановлен")
+    bex.to.me
+
+
+fun loop_stop()
+    bgmx.var.int: <<LOOP_RUNNING = 0>>: bgmx.var.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.9. Worker Pool — состояние
+// ----------------------------------------------------------------------------
+
+bgmx.var.int: <<WORKERS_ACTIVE = 0>>: bgmx.var.end
+bgmx.var.int: <<WORKERS_IDLE = 0>>: bgmx.var.end
+bgmx.var.int: <<TASKS_DONE = 0>>: bgmx.var.end
+bgmx.var.int: <<TASKS_FAILED = 0>>: bgmx.var.end
+bgmx.var.int: <<TASKS_RETRIED = 0>>: bgmx.var.end
+bgmx.var.int: <<WORKERS_RUNNING = 0>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 4.10. Worker Pool — взятие задачи
+// ----------------------------------------------------------------------------
+
+// Воркер пытается взять задачу из очереди.
+// Возвращает задачу или {}.
+fun worker_acquire()
+    bgmx.anon: <<q_empty() == 1>>
+        bex.to.me {}
+    bgmx.to.ef
+    bex.to.me q_pop()
+    bex.to.me {}
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.11. Worker Pool — выполнение задачи (заглушка, обработчик ниже)
+// ----------------------------------------------------------------------------
+
+// Выполняет задачу. Возвращает 1 (успех) или 0 (ошибка).
+// Реальная логика в блоке 6 (Callback API) и блоке 7 (Retry).
+fun worker_execute(task: dict)
+    // здесь будет вызов handler'а по типу задачи (см. блок 6)
+    bgmx.var.int: <<r = handle_task(task)>>: bgmx.var.end
+    bgmx.anon: <<r == 1>>
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.12. Worker Pool — один цикл воркера
+// ----------------------------------------------------------------------------
+
+// Один цикл: взять задачу -> выполнить -> обновить метрики.
+// Если очередь пуста — спим WORKER_IDLE_SLEEP_MS.
+fun worker_tick()
+    bgmx.var.dict: <<task = worker_acquire()>>: bgmx.var.end
+    bgmx.anon: <<len(task) == 0>>
+        bgmx.var.int: <<WORKERS_IDLE = WORKERS_IDLE + 1>>: bgmx.var.end
+        rt_sleep_ms(WORKER_IDLE_SLEEP_MS)
+        bex.to.me 0
+    bgmx.to.ef
+
+    bgmx.var.int: <<WORKERS_ACTIVE = WORKERS_ACTIVE + 1>>: bgmx.var.end
+    bgmx.var.int: <<tid = task["id"]>>: bgmx.var.end
+    bgmx.var.int: <<REG_TASK_ID = tid>>: bgmx.var.end
+
+    bgmx.var.int: <<ok = worker_execute(task)>>: bgmx.var.end
+    bgmx.var.int: <<WORKERS_ACTIVE = WORKERS_ACTIVE - 1>>: bgmx.var.end
+
+    bgmx.anon: <<ok == 1>>
+        bgmx.var.int: <<TASKS_DONE = TASKS_DONE + 1>>: bgmx.var.end
+    bgmx.to.ef
+    bgmx.anon: <<ok == 0>>
+        bgmx.var.int: <<TASKS_FAILED = TASKS_FAILED + 1>>: bgmx.var.end
+        // отдаём в retry (см. блок 7)
+        retry_schedule(task)
+    bgmx.to.ef
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.13. Worker Pool — главный цикл одного воркера
+// ----------------------------------------------------------------------------
+
+fun worker_loop()
+    while WORKERS_RUNNING == 1
+        worker_tick()
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.14. Worker Pool — запуск/остановка всех воркеров
+// ----------------------------------------------------------------------------
+
+fun workers_start(count: int)
+    bgmx.var.int: <<WORKERS_RUNNING = 1>>: bgmx.var.end
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < count
+        rt_debug("воркер запущен: " + i)
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me
+
+
+fun workers_stop()
+    bgmx.var.int: <<WORKERS_RUNNING = 0>>: bgmx.var.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.15. Метрики рантайма (сводка)
+// ----------------------------------------------------------------------------
+
+fun runtime_metrics()
+    bgmx.var.dict: <<m = {">>: bgmx.var.end
+        "loop_ticks": LOOP_TICK,
+        "accepted": LOOP_ACCEPTED,
+        "parsed": LOOP_PARSED,
+        "parse_err": LOOP_PARSE_ERR,
+        "enqueued": LOOP_ENQUEUED,
+        "enq_fail": LOOP_ENQ_FAIL,
+        "q_size": Q_SIZE,
+        "q_max_seen": Q_MAX_SEEN,
+        "q_pushed": Q_PUSHED,
+        "q_popped": Q_POPPED,
+        "q_dropped": Q_DROPPED,
+        "tasks_done": TASKS_DONE,
+        "tasks_failed": TASKS_FAILED,
+        "tasks_retried": TASKS_RETRIED
+    }
+    bex.to.me m
+    bex.to.me {}
+
+
+fun metrics_print()
+    bgmx.var.dict: <<m = runtime_metrics()>>: bgmx.var.end
+    rt_print("=== Метрики ===")
+    bgmx.var.list: <<keys = ["loop_ticks","accepted","parsed","parse_err","enqueued","q_size","q_max_seen","tasks_done","tasks_failed","tasks_retried"]>>: bgmx.var.end
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < len(keys)
+        bgmx.var.string: <<k = keys[i]>>: bgmx.var.end
+        bgmx.bxprint: <<"  " + k + " = ">>: bgmx.print.end
+        bgmx.bxprint: <<m[k]>>: bgmx.print.end
+        bgmx.bxprint: <<"\n">>: bgmx.print.end
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 4.16. Конец блока 4
+// ----------------------------------------------------------------------------
+// Следующий блок: Callback API (ВК/Telegram), to.text, диспетчер задач.
+// ----------------------------------------------------------------------------
+// ============================================================================
+// Блок 5 — Callback API (ВК/Telegram), to.text, диспетчер задач
+// ============================================================================
+//
+// Задачи слоя:
+//   - обработать задачу по её типу (message_new, message, callback_query, ...)
+//   - извлечь текст сообщения из payload (ВК и TG различаются)
+//   - отправить ответ через to.text(...)
+//   - поддерживать команды (/start, /help, /ping, /stats, /stop)
+//   - подтверждать confirmation для ВК (обязательный шаг)
+//
+// Всё работает через Callback API. Long polling нет.
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.1. Константы диспетчера
+// ----------------------------------------------------------------------------
+
+// Счётчики обработанных событий по типам
+bgmx.var.int: <<C_MSG_NEW = 0>>: bgmx.var.end
+bgmx.var.int: <<C_CONFIRM = 0>>: bgmx.var.end
+bgmx.var.int: <<C_CALLBACK = 0>>: bgmx.var.end
+bgmx.var.int: <<C_REPLY = 0>>: bgmx.var.end
+bgmx.var.int: <<C_UNKNOWN = 0>>: bgmx.var.end
+
+// Ключ подтверждения ВК (задаётся при настройке Callback API)
+bgmx.var.string: <<VK_CONFIRMATION_CODE = "gtwrite_confirm_ok">>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 5.2. Извлечение текста сообщения (ВК)
+// ----------------------------------------------------------------------------
+
+// ВК: payload.object.message.text
+fun extract_vk_text(payload: dict)
+    bgmx.var.any: <<obj = json_get(payload, "object", {})>>: bgmx.var.end
+    bgmx.anon: <<len(obj) == 0>>
+        bex.to.me ""
+    bgmx.to.ef
+    bgmx.var.any: <<msg = json_get(obj, "message", {})>>: bgmx.var.end
+    bgmx.anon: <<len(msg) == 0>>
+        bex.to.me ""
+    bgmx.to.ef
+    bex.to.me json_get(msg, "text", "")
+    bex.to.me ""
+
+
+// ВК: peer_id (кому отвечать)
+fun extract_vk_peer(payload: dict)
+    bgmx.var.any: <<obj = json_get(payload, "object", {})>>: bgmx.var.end
+    bgmx.anon: <<len(obj) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.any: <<msg = json_get(obj, "message", {})>>: bgmx.var.end
+    bgmx.anon: <<len(msg) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bex.to.me json_get(msg, "peer_id", 0)
+    bex.to.me 0
+
+
+// ВК: from_id (кто написал)
+fun extract_vk_from(payload: dict)
+    bgmx.var.any: <<obj = json_get(payload, "object", {})>>: bgmx.var.end
+    bgmx.anon: <<len(obj) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.any: <<msg = json_get(obj, "message", {})>>: bgmx.var.end
+    bgmx.anon: <<len(msg) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bex.to.me json_get(msg, "from_id", 0)
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.3. Извлечение текста сообщения (Telegram)
+// ----------------------------------------------------------------------------
+
+// TG: payload.message.text
+fun extract_tg_text(payload: dict)
+    bgmx.var.any: <<msg = json_get(payload, "message", {})>>: bgmx.var.end
+    bgmx.anon: <<len(msg) == 0>>
+        bex.to.me ""
+    bgmx.to.ef
+    bex.to.me json_get(msg, "text", "")
+    bex.to.me ""
+
+
+// TG: chat.id
+fun extract_tg_chat(payload: dict)
+    bgmx.var.any: <<msg = json_get(payload, "message", {})>>: bgmx.var.end
+    bgmx.anon: <<len(msg) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.any: <<chat = json_get(msg, "chat", {})>>: bgmx.var.end
+    bgmx.anon: <<len(chat) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bex.to.me json_get(chat, "id", 0)
+    bex.to.me 0
+
+
+// TG: from.id
+fun extract_tg_from(payload: dict)
+    bgmx.var.any: <<msg = json_get(payload, "message", {})>>: bgmx.var.end
+    bgmx.anon: <<len(msg) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bgmx.var.any: <<frm = json_get(msg, "from", {})>>: bgmx.var.end
+    bgmx.anon: <<len(frm) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+    bex.to.me json_get(frm, "id", 0)
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.4. Универсальное извлечение
+// ----------------------------------------------------------------------------
+
+// Возвращает текст сообщения независимо от источника.
+fun extract_text(task: dict)
+    bgmx.var.string: <<src = task["source"]>>: bgmx.var.end
+    bgmx.var.dict: <<payload = task["payload"]>>: bgmx.var.end
+    bgmx.anon: <<src == API_VK>>
+        bex.to.me extract_vk_text(payload)
+    bgmx.to.ef
+    bgmx.anon: <<src == API_TG>>
+        bex.to.me extract_tg_text(payload)
+    bgmx.to.ef
+    bex.to.me ""
+    bex.to.me ""
+
+
+// Возвращает ID получателя (peer/chat) независимо от источника.
+fun extract_chat_id(task: dict)
+    bgmx.var.string: <<src = task["source"]>>: bgmx.var.end
+    bgmx.var.dict: <<payload = task["payload"]>>: bgmx.var.end
+    bgmx.anon: <<src == API_VK>>
+        bex.to.me extract_vk_peer(payload)
+    bgmx.to.ef
+    bgmx.anon: <<src == API_TG>>
+        bex.to.me extract_tg_chat(payload)
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.5. Отправка сообщения (to.text)
+// ----------------------------------------------------------------------------
+
+// Отправляет текст пользователю через Callback API.
+// В реальном рантайме здесь HTTP-запрос к API ВК/Telegram.
+// Здесь — заглушка, которая логирует отправку.
+fun send_to_api(chat_id: int, text: string)
+    bgmx.anon: <<chat_id == 0>>
+        rt_error("send_to_api: пустой chat_id")
+        bex.to.me 0
+    bgmx.to.ef
+    to.text(text)
+    rt_debug("отправлено в " + chat_id + ": " + text)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// Обёртка to.text для удобства.
+fun reply_to(task: dict, text: string)
+    bgmx.var.int: <<cid = extract_chat_id(task)>>: bgmx.var.end
+    bex.to.me send_to_api(cid, text)
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.6. Обработчики команд
+// ----------------------------------------------------------------------------
+
+// /start — приветствие.
+fun cmd_start(task: dict)
+    reply_to(task, "GTWrite runtime запущен. Я на связи.")
+    bex.to.me 1
+    bex.to.me 0
+
+
+// /help — справка по командам.
+fun cmd_help(task: dict)
+    bgmx.var.string: <<text = "Команды: /start /help /ping /stats /stop">>: bgmx.var.end
+    reply_to(task, text)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// /ping — проверка живости.
+fun cmd_ping(task: dict)
+    reply_to(task, "pong")
+    bex.to.me 1
+    bex.to.me 0
+
+
+// /stats — метрики рантайма.
+fun cmd_stats(task: dict)
+    bgmx.var.dict: <<m = runtime_metrics()>>: bgmx.var.end
+    bgmx.var.string: <<text = "ticks=" + m["loop_ticks"] + " q=" + m["q_size"] + " done=" + m["tasks_done"]>>: bgmx.var.end
+    reply_to(task, text)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// /stop — остановка рантайма.
+fun cmd_stop(task: dict)
+    reply_to(task, "Останавливаюсь...")
+    loop_stop()
+    workers_stop()
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.7. Диспетчер команд
+// ----------------------------------------------------------------------------
+
+// Определяет, является ли текст командой, и вызывает нужный обработчик.
+// Возвращает 1 если команда обработана, 0 если это не команда.
+fun dispatch_command(task: dict, text: string)
+    bgmx.anon: <<str_starts(text, "/start")>>
+        bex.to.me cmd_start(task)
+    bgmx.to.ef
+    bgmx.anon: <<str_starts(text, "/help")>>
+        bex.to.me cmd_help(task)
+    bgmx.to.ef
+    bgmx.anon: <<str_starts(text, "/ping")>>
+        bex.to.me cmd_ping(task)
+    bgmx.to.ef
+    bgmx.anon: <<str_starts(text, "/stats")>>
+        bex.to.me cmd_stats(task)
+    bgmx.to.ef
+    bgmx.anon: <<str_starts(text, "/stop")>>
+        bex.to.me cmd_stop(task)
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.8. Обработка confirmation (ВК)
+// ----------------------------------------------------------------------------
+
+// ВК требует вернуть строку подтверждения при событии confirmation.
+// Это обязательный шаг, иначе Callback API не активируется.
+fun handle_vk_confirmation(task: dict)
+    bgmx.var.dict: <<payload = task["payload"]>>: bgmx.var.end
+    bgmx.var.string: <<code = json_get(payload, "group_id", VK_CONFIRMATION_CODE)>>: bgmx.var.end
+    reply_to(task, VK_CONFIRMATION_CODE)
+    bgmx.var.int: <<C_CONFIRM = C_CONFIRM + 1>>: bgmx.var.end
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.9. Обработка message_new (ВК)
+// ----------------------------------------------------------------------------
+
+fun handle_vk_message(task: dict)
+    bgmx.var.string: <<text = extract_text(task)>>: bgmx.var.end
+    bgmx.var.int: <<C_MSG_NEW = C_MSG_NEW + 1>>: bgmx.var.end
+
+    bgmx.anon: <<len(text) == 0>>
+        bex.to.me 1
+    bgmx.to.ef
+
+    // команда?
+    bgmx.anon: <<dispatch_command(task, text) == 1>>
+        bex.to.me 1
+    bgmx.to.ef
+
+    // эхо
+    reply_to(task, "Ты написал: " + text)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.10. Обработка message (Telegram)
+// ----------------------------------------------------------------------------
+
+fun handle_tg_message(task: dict)
+    bgmx.var.string: <<text = extract_text(task)>>: bgmx.var.end
+    bgmx.var.int: <<C_MSG_NEW = C_MSG_NEW + 1>>: bgmx.var.end
+
+    bgmx.anon: <<len(text) == 0>>
+        bex.to.me 1
+    bgmx.to.ef
+
+    bgmx.anon: <<dispatch_command(task, text) == 1>>
+        bex.to.me 1
+    bgmx.to.ef
+
+    reply_to(task, "Ты написал: " + text)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.11. Обработка callback_query (Telegram)
+// ----------------------------------------------------------------------------
+
+fun handle_tg_callback(task: dict)
+    bgmx.var.int: <<C_CALLBACK = C_CALLBACK + 1>>: bgmx.var.end
+    bgmx.var.dict: <<payload = task["payload"]>>: bgmx.var.end
+    bgmx.var.any: <<cb = json_get(payload, "callback_query", {})>>: bgmx.var.end
+    bgmx.var.string: <<data = json_get(cb, "data", "")>>: bgmx.var.end
+    reply_to(task, "Callback: " + data)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.12. Главный диспетчер задач
+// ----------------------------------------------------------------------------
+
+// Вызывается воркером. Определяет тип задачи и вызывает обработчик.
+// Возвращает 1 (успех) или 0 (ошибка — уйдёт в retry).
+fun handle_task(task: dict)
+    bgmx.anon: <<len(task) == 0>>
+        bex.to.me 0
+    bgmx.to.ef
+
+    bgmx.var.string: <<src = task["source"]>>: bgmx.var.end
+    bgmx.var.string: <<etype = task["type"]>>: bgmx.var.end
+
+    // ВК
+    bgmx.anon: <<src == API_VK>>
+        bgmx.anon: <<etype == VK_EVENT_CONFIRMATION>>
+            bex.to.me handle_vk_confirmation(task)
+        bgmx.to.ef
+        bgmx.anon: <<etype == VK_EVENT_MESSAGE_NEW>>
+            bex.to.me handle_vk_message(task)
+        bgmx.to.ef
+        bgmx.anon: <<etype == VK_EVENT_MESSAGE_REPLY>>
+            bgmx.var.int: <<C_REPLY = C_REPLY + 1>>: bgmx.var.end
+            bex.to.me 1
+        bgmx.to.ef
+    bgmx.to.ef
+
+    // Telegram
+    bgmx.anon: <<src == API_TG>>
+        bgmx.anon: <<etype == TG_EVENT_MESSAGE>>
+            bex.to.me handle_tg_message(task)
+        bgmx.to.ef
+        bgmx.anon: <<etype == TG_EVENT_CALLBACK>>
+            bex.to.me handle_tg_callback(task)
+        bgmx.to.ef
+    bgmx.to.ef
+
+    bgmx.var.int: <<C_UNKNOWN = C_UNKNOWN + 1>>: bgmx.var.end
+    rt_debug("handle_task: неизвестный тип " + etype)
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.13. Статистика диспетчера
+// ----------------------------------------------------------------------------
+
+fun dispatcher_stats()
+    bgmx.var.dict: <<s = {">>: bgmx.var.end
+        "vk_message_new": C_MSG_NEW,
+        "vk_confirmation": C_CONFIRM,
+        "tg_callback": C_CALLBACK,
+        "vk_reply": C_REPLY,
+        "unknown": C_UNKNOWN
+    }
+    bex.to.me s
+    bex.to.me {}
+
+
+// ----------------------------------------------------------------------------
+// Раздел 5.14. Конец блока 5
+// ----------------------------------------------------------------------------
+// Следующий блок: Retry logic (обработка ошибок API, backoff, повторные попытки).
+// ----------------------------------------------------------------------------
+// ============================================================================
+// Блок 6 — Retry logic (обработка ошибок API, backoff, повторные попытки)
+// ============================================================================
+//
+// Если соединение с API упало или обработчик вернул ошибку — задача
+// не теряется, а уходит в retry-очередь. Стратегия: экспоненциальный
+// backoff с ограничением.
+//
+//   delay = base * multiplier^(attempt-1), но не больше max_delay
+//
+// После RETRY_MAX попыток задача считается «мёртвой» и уходит в dead-letter.
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.1. Состояние retry-очереди
+// ----------------------------------------------------------------------------
+
+// Очередь задач, ожидающих повтора: список словарей
+// { "task": dict, "attempt": int, "next_ms": int }
+bgmx.var.list: <<RETRY_QUEUE = []>>: bgmx.var.end
+
+// Счётчики
+bgmx.var.int: <<RETRY_SCHEDULED = 0>>: bgmx.var.end
+bgmx.var.int: <<RETRY_ATTEMPTED = 0>>: bgmx.var.end
+bgmx.var.int: <<RETRY_EXHAUSTED = 0>>: bgmx.var.end
+bgmx.var.int: <<RETRY_SUCCEEDED = 0>>: bgmx.var.end
+
+// Dead-letter: задачи, которые не удалось выполнить после всех попыток
+bgmx.var.list: <<DEAD_LETTER = []>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 6.2. Вычисление задержки
+// ----------------------------------------------------------------------------
+
+// Вычисляет задержку перед повтором (экспоненциальный backoff).
+// attempt — номер попытки (1-based).
+fun retry_delay_ms(attempt: int)
+    bgmx.var.int: <<delay = RETRY_BASE_DELAY_MS>>: bgmx.var.end
+    bgmx.var.int: <<i = 1>>: bgmx.var.end
+    while i < attempt
+        bgmx.var.int: <<delay = delay * 2>>: bgmx.var.end
+        bgmx.anon: <<delay >= RETRY_MAX_DELAY_MS>>
+            bgmx.var.int: <<delay = RETRY_MAX_DELAY_MS>>: bgmx.var.end
+            bex.to.me delay
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me delay
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.3. Планирование повтора
+// ----------------------------------------------------------------------------
+
+// Ставит задачу в retry-очередь.
+// Если попыток уже RETRY_MAX — уходит в dead-letter.
+fun retry_schedule(task: dict)
+    bgmx.var.int: <<attempt = task["retries"]>>: bgmx.var.end
+    bgmx.var.int: <<attempt = attempt + 1>>: bgmx.var.end
+    task["retries"] = attempt
+
+    bgmx.anon: <<attempt > RETRY_MAX>>
+        bgmx.var.list: <<DEAD_LETTER = DEAD_LETTER + [task]>>: bgmx.var.end
+        bgmx.var.int: <<RETRY_EXHAUSTED = RETRY_EXHAUSTED + 1>>: bgmx.var.end
+        rt_error("retry исчерпан для задачи " + task["id"])
+        bex.to.me 0
+    bgmx.to.ef
+
+    bgmx.var.int: <<delay = retry_delay_ms(attempt)>>: bgmx.var.end
+    bgmx.var.int: <<next_ms = clock_now_ms() + delay>>: bgmx.var.end
+    bgmx.var.dict: <<entry = {">>: bgmx.var.end
+        "task": task,
+        "attempt": attempt,
+        "next_ms": next_ms
+    }
+    bgmx.var.list: <<RETRY_QUEUE = RETRY_QUEUE + [entry]>>: bgmx.var.end
+    bgmx.var.int: <<RETRY_SCHEDULED = RETRY_SCHEDULED + 1>>: bgmx.var.end
+    rt_debug("retry запланирован: задача " + task["id"] + " через " + delay + " мс")
+    bex.to.me 1
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.4. Обработка retry-очереди
+// ----------------------------------------------------------------------------
+
+// Проходит по retry-очереди, берёт готовые задачи (next_ms <= now)
+// и возвращает их обратно в основную очередь.
+// Возвращает число возвращённых задач.
+fun retry_tick()
+    bgmx.var.int: <<now = clock_now_ms()>>: bgmx.var.end
+    bgmx.var.list: <<ready = []>>: bgmx.var.end
+    bgmx.var.list: <<still_waiting = []>>: bgmx.var.end
+
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < len(RETRY_QUEUE)
+        bgmx.var.dict: <<entry = RETRY_QUEUE[i]>>: bgmx.var.end
+        bgmx.var.int: <<next_ms = entry["next_ms"]>>: bgmx.var.end
+        bgmx.anon: <<next_ms <= now>>
+            bgmx.var.list: <<ready = ready + [entry]>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.anon: <<next_ms > now>>
+            bgmx.var.list: <<still_waiting = still_waiting + [entry]>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+
+    bgmx.var.list: <<RETRY_QUEUE = still_waiting>>: bgmx.var.end
+
+    bgmx.var.int: <<j = 0>>: bgmx.var.end
+    while j < len(ready)
+        bgmx.var.dict: <<entry = ready[j]>>: bgmx.var.end
+        bgmx.var.dict: <<task = entry["task"]>>: bgmx.var.end
+        bgmx.var.int: <<RETRY_ATTEMPTED = RETRY_ATTEMPTED + 1>>: bgmx.var.end
+        q_push(task)
+        bgmx.var.int: <<j = j + 1>>: bgmx.var.end
+
+    bex.to.me len(ready)
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.5. Проверка соединения перед повтором
+// ----------------------------------------------------------------------------
+
+// Если соединение с API упало — retry не имеет смысла.
+// Эта функция проверяет и, если нужно, "переоткрывает" соединение.
+fun retry_check_connection()
+    bgmx.anon: <<http_check_connection() == 1>>
+        bex.to.me 1
+    bgmx.to.ef
+    rt_error("retry: соединение потеряно, переоткрываю")
+    bgmx.var.int: <<CONN_ALIVE = 0>>: bgmx.var.end
+    // Попытка переоткрыть
+    http_open_connection()
+    bgmx.anon: <<http_check_connection() == 1>>
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.6. Обработка ошибок API
+// ----------------------------------------------------------------------------
+
+// Обёртка над handle_task с перехватом ошибок.
+// Если задача падает — она уходит в retry.
+// Возвращает 1 (успех) или 0 (уйдёт в retry).
+fun safe_execute(task: dict)
+    bgmx.anon: <<retry_check_connection() == 0>>
+        bgmx.var.int: <<TASKS_FAILED = TASKS_FAILED + 1>>: bgmx.var.end
+        retry_schedule(task)
+        bex.to.me 0
+    bgmx.to.ef
+
+    bgmx.var.int: <<ok = handle_task(task)>>: bgmx.var.end
+    bgmx.anon: <<ok == 1>>
+        bgmx.var.int: <<RETRY_SUCCEEDED = RETRY_SUCCEEDED + 1>>: bgmx.var.end
+        bex.to.me 1
+    bgmx.to.ef
+    bex.to.me 0
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.7. Dead-letter — статистика и очистка
+// ----------------------------------------------------------------------------
+
+fun dead_letter_count()
+    bex.to.me len(DEAD_LETTER)
+    bex.to.me 0
+
+
+fun dead_letter_print()
+    rt_print("Dead-letter: " + len(DEAD_LETTER) + " задач")
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < len(DEAD_LETTER)
+        bgmx.var.dict: <<t = DEAD_LETTER[i]>>: bgmx.var.end
+        rt_print("  задача " + t["id"] + " type=" + t["type"] + " retries=" + t["retries"])
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+    bex.to.me
+
+
+fun dead_letter_clear()
+    bgmx.var.list: <<DEAD_LETTER = []>>: bgmx.var.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.8. Метрики retry
+// ----------------------------------------------------------------------------
+
+fun retry_metrics()
+    bgmx.var.dict: <<m = {">>: bgmx.var.end
+        "scheduled": RETRY_SCHEDULED,
+        "attempted": RETRY_ATTEMPTED,
+        "exhausted": RETRY_EXHAUSTED,
+        "succeeded": RETRY_SUCCEEDED,
+        "queue_size": len(RETRY_QUEUE),
+        "dead_letter": len(DEAD_LETTER)
+    }
+    bex.to.me m
+    bex.to.me {}
+
+
+// ----------------------------------------------------------------------------
+// Раздел 6.9. Конец блока 6
+// ----------------------------------------------------------------------------
+// Следующий блок: финальный — сборка рантайма, запуск, точка входа.
+// ----------------------------------------------------------------------------
+// ============================================================================
+// Блок 7 — Сборка рантайма, запуск, точка входа (финал)
+// ============================================================================
+//
+// Здесь рантайм собирается воедино:
+//   - инициализация всех компонентов
+//   - главный цикл: loop + workers + retry
+//   - корректная остановка
+//   - демонстрационный запуск
+//   - точка входа demo()
+// ============================================================================
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.1. Состояние рантайма
+// ----------------------------------------------------------------------------
+
+bgmx.var.int: <<RT_RUNNING = 0>>: bgmx.var.end
+bgmx.var.int: <<RT_STARTED_MS = 0>>: bgmx.var.end
+bgmx.var.int: <<RT_STOPPED_MS = 0>>: bgmx.var.end
+bgmx.var.int: <<RT_UPTIME_MS = 0>>: bgmx.var.end
+
+// ----------------------------------------------------------------------------
+// Раздел 7.2. Инициализация рантайма
+// ----------------------------------------------------------------------------
+
+// Сбрасывает все счётчики и очереди в исходное состояние.
+fun rt_init()
+    rt_print("=== " + RT_NAME + " v" + RT_VERSION + " ===")
+    rt_print("Автор: " + RT_AUTHOR + " (" + RT_COMPANY + ")")
+
+    // HTTP
+    bgmx.var.int: <<CONN_ALIVE = 0>>: bgmx.var.end
+    bgmx.var.int: <<CONN_ID = 0>>: bgmx.var.end
+    bgmx.var.int: <<CONN_ACTIVE = 0>>: bgmx.var.end
+
+    // Очередь
+    q_reset()
+    bgmx.var.int: <<Q_PUSHED = 0>>: bgmx.var.end
+    bgmx.var.int: <<Q_POPPED = 0>>: bgmx.var.end
+    bgmx.var.int: <<Q_DROPPED = 0>>: bgmx.var.end
+    bgmx.var.int: <<Q_MAX_SEEN = 0>>: bgmx.var.end
+
+    // Loop
+    bgmx.var.int: <<LOOP_ACCEPTED = 0>>: bgmx.var.end
+    bgmx.var.int: <<LOOP_PARSED = 0>>: bgmx.var.end
+    bgmx.var.int: <<LOOP_PARSE_ERR = 0>>: bgmx.var.end
+    bgmx.var.int: <<LOOP_ENQUEUED = 0>>: bgmx.var.end
+    bgmx.var.int: <<LOOP_ENQ_FAIL = 0>>: bgmx.var.end
+    bgmx.var.int: <<LOOP_TICK = 0>>: bgmx.var.end
+
+    // Workers
+    bgmx.var.int: <<WORKERS_ACTIVE = 0>>: bgmx.var.end
+    bgmx.var.int: <<WORKERS_IDLE = 0>>: bgmx.var.end
+    bgmx.var.int: <<TASKS_DONE = 0>>: bgmx.var.end
+    bgmx.var.int: <<TASKS_FAILED = 0>>: bgmx.var.end
+    bgmx.var.int: <<TASKS_RETRIED = 0>>: bgmx.var.end
+
+    // Retry
+    bgmx.var.list: <<RETRY_QUEUE = []>>: bgmx.var.end
+    bgmx.var.list: <<DEAD_LETTER = []>>: bgmx.var.end
+    bgmx.var.int: <<RETRY_SCHEDULED = 0>>: bgmx.var.end
+    bgmx.var.int: <<RETRY_ATTEMPTED = 0>>: bgmx.var.end
+    bgmx.var.int: <<RETRY_EXHAUSTED = 0>>: bgmx.var.end
+    bgmx.var.int: <<RETRY_SUCCEEDED = 0>>: bgmx.var.end
+
+    rt_print("Инициализация завершена")
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.3. Главный тик рантайма
+// ----------------------------------------------------------------------------
+
+// Один тик всего рантайма:
+//   1. принять запрос (event loop)
+//   2. обработать retry-очередь
+//   3. выполнить задачи воркерами
+// Возвращает число обработанных задач.
+fun rt_tick()
+    bgmx.var.int: <<handled = 0>>: bgmx.var.end
+
+    // 1. Event loop
+    bgmx.anon: <<loop_tick() == 1>>
+        bgmx.var.int: <<handled = handled + 1>>: bgmx.var.end
+    bgmx.to.ef
+
+    // 2. Retry
+    bgmx.anon: <<retry_tick() > 0>>
+        bgmx.var.int: <<handled = handled + 1>>: bgmx.var.end
+    bgmx.to.ef
+
+    // 3. Workers (по одному тику на воркер)
+    bgmx.var.int: <<i = 0>>: bgmx.var.end
+    while i < WORKERS_COUNT
+        bgmx.anon: <<worker_tick() == 1>>
+            bgmx.var.int: <<handled = handled + 1>>: bgmx.var.end
+        bgmx.to.ef
+        bgmx.var.int: <<i = i + 1>>: bgmx.var.end
+
+    bex.to.me handled
+    bex.to.me 0
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.4. Главный цикл рантайма
+// ----------------------------------------------------------------------------
+
+fun rt_run(max_ticks: int)
+    bgmx.var.int: <<RT_RUNNING = 1>>: bgmx.var.end
+    bgmx.var.int: <<RT_STARTED_MS = clock_now_ms()>>: bgmx.var.end
+    rt_print("Рантайм запущен")
+
+    bgmx.var.int: <<ticks = 0>>: bgmx.var.end
+    while RT_RUNNING == 1
+        rt_tick()
+        bgmx.var.int: <<ticks = ticks + 1>>: bgmx.var.end
+        bgmx.anon: <<max_ticks > 0>>
+            bgmx.anon: <<ticks >= max_ticks>>
+                bgmx.var.int: <<RT_RUNNING = 0>>: bgmx.var.end
+            bgmx.to.ef
+        bgmx.to.ef
+
+    bgmx.var.int: <<RT_STOPPED_MS = clock_now_ms()>>: bgmx.var.end
+    bgmx.var.int: <<RT_UPTIME_MS = RT_STOPPED_MS - RT_STARTED_MS>>: bgmx.var.end
+    rt_print("Рантайм остановлен")
+    bex.to.me
+
+
+fun rt_stop()
+    bgmx.var.int: <<RT_RUNNING = 0>>: bgmx.var.end
+    loop_stop()
+    workers_stop()
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.5. Финальная сводка
+// ----------------------------------------------------------------------------
+
+fun rt_summary()
+    rt_print("=== Итоговая сводка ===")
+    bgmx.var.dict: <<m = runtime_metrics()>>: bgmx.var.end
+    bgmx.var.dict: <<r = retry_metrics()>>: bgmx.var.end
+    bgmx.var.dict: <<d = dispatcher_stats()>>: bgmx.var.end
+
+    rt_print("Принято запросов: " + m["accepted"])
+    rt_print("Распарсено JSON: " + m["parsed"])
+    rt_print("Поставлено в очередь: " + m["enqueued"])
+    rt_print("Выполнено задач: " + m["tasks_done"])
+    rt_print("Провалено задач: " + m["tasks_failed"])
+    rt_print("Retry запланировано: " + r["scheduled"])
+    rt_print("Retry исчерпано: " + r["exhausted"])
+    rt_print("Dead-letter: " + r["dead_letter"])
+    rt_print("VK message_new: " + d["vk_message_new"])
+    rt_print("VK confirmation: " + d["vk_confirmation"])
+    rt_print("TG callback: " + d["tg_callback"])
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.6. Демонстрация: имитация входящих событий
+// ----------------------------------------------------------------------------
+
+// Имитирует входящий запрос ВК и кладёт его в CONN_BUFFER,
+// чтобы loop_tick его обработал.
+fun demo_push_vk_message(text: string)
+    bgmx.var.string: <<body = "{\"type\":\"message_new\",\"object\":{\"message\":{\"text\":\"" + text + "\",\"peer_id\":1,\"from_id\":2}}}">>: bgmx.var.end
+    bgmx.var.string: <<raw = "POST /callback HTTP/1.1" + LINE_END + "Content-Type: application/json" + LINE_END + LINE_END + body>>: bgmx.var.end
+    bgmx.var.string: <<CONN_BUFFER = raw>>: bgmx.var.end
+    bgmx.var.int: <<CONN_ALIVE = 1>>: bgmx.var.end
+    bgmx.var.int: <<CONN_RESPONDED = 0>>: bgmx.var.end
+    bex.to.me
+
+
+// Имитирует входящее сообщение Telegram.
+fun demo_push_tg_message(text: string)
+    bgmx.var.string: <<body = "{\"update_id\":100,\"message\":{\"text\":\"" + text + "\",\"chat\":{\"id\":42},\"from\":{\"id\":42}}}">>: bgmx.var.end
+    bgmx.var.string: <<raw = "POST /webhook HTTP/1.1" + LINE_END + "Content-Type: application/json" + LINE_END + LINE_END + body>>: bgmx.var.end
+    bgmx.var.string: <<CONN_BUFFER = raw>>: bgmx.var.end
+    bgmx.var.int: <<CONN_ALIVE = 1>>: bgmx.var.end
+    bgmx.var.int: <<CONN_RESPONDED = 0>>: bgmx.var.end
+    bex.to.me
+
+
+// Имитирует confirmation ВК.
+fun demo_push_vk_confirmation()
+    bgmx.var.string: <<body = "{\"type\":\"confirmation\",\"group_id\":1}">>: bgmx.var.end
+    bgmx.var.string: <<raw = "POST /callback HTTP/1.1" + LINE_END + "Content-Type: application/json" + LINE_END + LINE_END + body>>: bgmx.var.end
+    bgmx.var.string: <<CONN_BUFFER = raw>>: bgmx.var.end
+    bgmx.var.int: <<CONN_ALIVE = 1>>: bgmx.var.end
+    bgmx.var.int: <<CONN_RESPONDED = 0>>: bgmx.var.end
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.7. Smoke test
+// ----------------------------------------------------------------------------
+
+fun smoke_test()
+    rt_print("=== Smoke Test ===")
+
+    // 1. JSON
+    bgmx.var.dict: <<j = json_parse("{\"a\":1,\"b\":\"x\"}")>>: bgmx.var.end
+    rt_print("json.a = " + j["a"])
+    rt_print("json.b = " + j["b"])
+
+    // 2. Очередь
+    q_reset()
+    bgmx.var.dict: <<t1 = {">>: bgmx.var.end "id":1, "type":"test", "prio":PRIO_NORMAL, "retries":0 }
+    q_push(t1)
+    rt_print("q_size после push = " + Q_SIZE)
+
+    // 3. HTTP-приём
+    demo_push_vk_message("/ping")
+    bgmx.var.dict: <<req = http_accept()>>: bgmx.var.end
+    rt_print("http.method = " + req["method"])
+
+    // 4. Retry
+    bgmx.var.dict: <<t2 = {">>: bgmx.var.end "id":2, "type":"test", "prio":PRIO_NORMAL, "retries":0 }
+    retry_schedule(t2)
+    rt_print("retry queue = " + len(RETRY_QUEUE))
+
+    rt_print("=== Smoke Test OK ===")
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.8. Демонстрация (главная)
+// ----------------------------------------------------------------------------
+
+fun demo()
+    rt_init()
+
+    // 1. Smoke test
+    smoke_test()
+
+    // 2. Имитируем поток событий
+    rt_print("")
+    rt_print("=== Имитация событий ===")
+    demo_push_vk_confirmation()
+    rt_print("тик 1: " + rt_tick())
+
+    demo_push_vk_message("/start")
+    rt_print("тик 2: " + rt_tick())
+
+    demo_push_vk_message("привет")
+    rt_print("тик 3: " + rt_tick())
+
+    demo_push_tg_message("/help")
+    rt_print("тик 4: " + rt_tick())
+
+    demo_push_tg_message("тест")
+    rt_print("тик 5: " + rt_tick())
+
+    // 3. Метрики
+    rt_print("")
+    metrics_print()
+    rt_summary()
+
+    rt_print("")
+    rt_print("=== Демо завершено ===")
+    bex.to.me
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.9. Точка входа
+// ----------------------------------------------------------------------------
+
+// Вызывается при старте программы.
+fun main()
+    demo()
+    bex.to.me
+
+
+// Автозапуск (в Begamix main вызывается автоматически).
+main()
+
+
+// ----------------------------------------------------------------------------
+// Раздел 7.10. Конец файла
+// ----------------------------------------------------------------------------
+// GTWrite v1.0.0
+// Автор: Kerry Silver AI (Silver AI Company)
+// Асинхронный рантайм под Callback API (ВК/Telegram).
+// Zero-Latency: 200 OK отправляется ДО обработки сообщения.
+// ============================================================================
